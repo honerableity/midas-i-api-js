@@ -1,0 +1,9 @@
+{
+  "name": "midas-product-validate-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Vercel serverless API used by Roblox Studio (via HttpService) to validate whether a Roblox user is allowed to use a product in a given place. Shares the same Firestore project as the MIDAS Discord bot.",
+  "dependencies": {
+    "firebase-admin": "^12.6.0"
+  }
+}

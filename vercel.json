@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/validate.js": {
+      "maxDuration": 10
+    }
+  }
+}
