@@ -4,10 +4,12 @@
 // whether a Roblox user is allowed to use a given product in a given place.
 //
 // Access is granted if EITHER:
-//   (a) an admin explicitly whitelisted this discordId for this exact
-//       placeId on this product (productWhitelists doc), OR
-//   (b) the place's universe is owned by a Roblox group, and this user has
-//       linked that same group to their account via "/verify linkgroup",
+//   (a) this discordId is a plain owner of the product (products.owners,
+//       granted via /product give or a completed ticket order) -- this
+//       grants use in ANY place, no place-scoping at all, OR
+//   (b) the place's universe is owned by a Roblox group, this product has
+//       been whitelisted to that group (/product groupwhitelist), this user
+//       has linked that same group to their account via "/verify linkgroup",
 //       AND is still (live-checked, not cached) a member of that group.
 //
 // If a linked group was used for the grant, losing membership removes
@@ -49,6 +51,7 @@ module.exports = async (req, res) => {
   if (!productSnap.exists) {
     return deny(res, 404, 'product_not_found');
   }
+  const product = productSnap.data();
 
   // 2. Resolve robloxUserId -> discordId. Only verified users can own/use
   //    products -- this mirrors the bot's existing verification gate.
@@ -64,21 +67,17 @@ module.exports = async (req, res) => {
   const discordId = verifiedQuery.docs[0].id;
   const verifiedUser = verifiedQuery.docs[0].data();
 
-  // 3a. Explicit per-place whitelist grant (admin-managed).
-  const whitelistId = `${productId}_${discordId}`;
-  const whitelistSnap = await db.collection('productWhitelists').doc(whitelistId).get();
-  if (whitelistSnap.exists) {
-    const placeIds = whitelistSnap.data().placeIds || [];
-    if (placeIds.map(String).includes(String(placeId))) {
-      return res.status(200).json({
-        allowed: true,
-        via: 'explicit_whitelist',
-      });
-    }
+  // 3a. Plain ownership -- no place-scoping, valid everywhere.
+  const owners = (product.owners || []).map(String);
+  if (owners.includes(discordId)) {
+    return res.status(200).json({
+      allowed: true,
+      via: 'ownership',
+    });
   }
 
-  // 3b. Linked-group grant: this product must ALSO be whitelisted to the
-  //     group itself (productGroupWhitelists), and the requesting place's
+  // 3b. Linked-group grant: this product must be whitelisted to the group
+  //     itself (productGroupWhitelists), and the requesting place's
   //     universe must be owned by that group, and the user must currently
   //     be a member of it.
   const linkedGroupIds = (verifiedUser.linkedGroupIds || []).map(String);
@@ -105,5 +104,5 @@ module.exports = async (req, res) => {
     }
   }
 
-  return deny(res, 403, 'not_whitelisted_for_place');
+  return deny(res, 403, 'not_whitelisted');
 };
