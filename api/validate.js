@@ -55,11 +55,27 @@ module.exports = async (req, res) => {
 
   // 2. Resolve robloxUserId -> discordId. Only verified users can own/use
   //    products -- this mirrors the bot's existing verification gate.
-  const verifiedQuery = await db
+  //
+  // robloxId in Firestore may be stored as either a number (the bot saves
+  // it straight from the Roblox API's JSON int) or a string, depending on
+  // when the doc was written. Try both so this doesn't silently miss users
+  // whose doc happens to use the other type.
+  let verifiedQuery = await db
     .collection('verifiedUsers')
     .where('robloxId', '==', String(robloxUserId))
     .limit(1)
     .get();
+
+  if (verifiedQuery.empty) {
+    const asNumber = Number(robloxUserId);
+    if (!Number.isNaN(asNumber)) {
+      verifiedQuery = await db
+        .collection('verifiedUsers')
+        .where('robloxId', '==', asNumber)
+        .limit(1)
+        .get();
+    }
+  }
 
   if (verifiedQuery.empty) {
     return deny(res, 403, 'user_not_verified');
