@@ -3,11 +3,13 @@
 // Called from Roblox (Studio plugin or live game via HttpService) to check
 // whether a Roblox user is allowed to use a given product in a given place.
 //
-// Access is granted if EITHER:
-//   (a) this discordId is a plain owner of the product (products.owners,
+// Access is granted if ANY of the following are true:
+//   (a) the product is priced under Rp.1000 ("free tier") and this user is
+//       verified -- granted in ANY place, no ownership record required, OR
+//   (b) this discordId is a plain owner of the product (products.owners,
 //       granted via /product give or a completed ticket order) -- this
 //       grants use in ANY place, no place-scoping at all, OR
-//   (b) the place's universe is owned by a Roblox group, this product has
+//   (c) the place's universe is owned by a Roblox group, this product has
 //       been whitelisted to that group (/product groupwhitelist), this user
 //       has linked that same group to their account via "/verify linkgroup",
 //       AND is still (live-checked, not cached) a member of that group.
@@ -82,6 +84,18 @@ module.exports = async (req, res) => {
   }
   const discordId = verifiedQuery.docs[0].id;
   const verifiedUser = verifiedQuery.docs[0].data();
+
+  // 3a-pre. Free tier -- products priced under Rp.1000 are granted to any
+  // verified user with no ownership record required. `product.price` is
+  // expected to be stored as a plain number (IDR) on the product doc; if
+  // it's missing/non-numeric we do NOT treat it as free (fail closed).
+  const price = Number(product.price);
+  if (!Number.isNaN(price) && price < 1000) {
+    return res.status(200).json({
+      allowed: true,
+      via: 'free_tier',
+    });
+  }
 
   // 3a. Plain ownership -- no place-scoping, valid everywhere.
   const owners = (product.owners || []).map(String);
