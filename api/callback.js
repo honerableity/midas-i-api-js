@@ -33,9 +33,25 @@ function errorPage(title, message) {
 }
 
 function successPage() {
-  return `<!doctype html><html><body style="font-family:sans-serif;text-align:center;padding:4rem">
-<h2>You're authorized!</h2>
-<p>Go back to Discord and click <b>Continue</b> to accept the rules and get your role.</p></body></html>`;
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="refresh" content="4;url=discord://" />
+  <title>Verified</title>
+</head>
+<body style="font-family:sans-serif;text-align:center;padding:4rem">
+  <h2>You're authorized!</h2>
+  <p>Redirecting you back to Discord in a few seconds&hellip;</p>
+  <p>Click <b>Continue</b> there to accept the rules and get your role.</p>
+  <p><a href="discord://">Click here if you're not redirected automatically</a></p>
+  <script>
+    setTimeout(function () {
+      window.location.href = 'discord://';
+    }, 3500);
+  </script>
+</body>
+</html>`;
 }
 
 module.exports = async (req, res) => {
