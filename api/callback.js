@@ -11,6 +11,12 @@
  * Role assignment and the rules-agreement step both happen back in
  * Discord (commands/verify.py) -- this route never touches the bot
  * token/gateway, it only ever writes the session doc.
+ *
+ * DIAGNOSTIC LOGGING: temporary console.error() calls added at each
+ * failure branch so Vercel logs show exactly which check failed
+ * (signature/expiry vs missing session doc vs stale state). Safe to
+ * strip once the root cause is confirmed -- none of them log secrets,
+ * codes, or full state/tokens.
  */
 const { db } = require('../lib/firebase');
 const { verifyState } = require('./_state');
@@ -37,6 +43,7 @@ module.exports = async (req, res) => {
   const { error, state, code } = req.query;
 
   if (error) {
+    console.error(`[callback] user declined OAuth consent: error=${error}`);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.status(200).send(errorPage(
       'Verification cancelled',
@@ -45,12 +52,20 @@ module.exports = async (req, res) => {
   }
 
   if (!state || !code) {
+    console.error(`[callback] missing state or code — state=${!!state} code=${!!code}`);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.status(400).send(errorPage('Bad request', 'Missing code or state.'));
   }
 
   const payload = verifyState(state);
   if (!payload) {
+    // This means verifyState() itself returned null -- either the HMAC
+    // signature didn't match (most likely: VERIFY_STATE_SECRET differs
+    // between the bot process and this Vercel deployment), the base64
+    // payload failed to parse, or payload.expiresAt was already in the
+    // past. _state.js doesn't currently distinguish these internally,
+    // so a null here is the first thing to rule out.
+    console.error('[callback] verifyState() returned null -- signature mismatch, malformed state, or already-expired payload. Check that VERIFY_STATE_SECRET matches exactly between the bot and Vercel envs.');
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.status(400).send(errorPage(
       'Link expired or invalid',
@@ -59,10 +74,28 @@ module.exports = async (req, res) => {
   }
 
   const { discordId } = payload;
+  console.error(`[callback] verifyState() OK for discordId=${discordId}, expiresAt=${payload.expiresAt}, now=${Date.now()}`);
 
   const sessionRef = db.collection('verifications').doc(discordId);
   const sessionSnap = await sessionRef.get();
-  if (!sessionSnap.exists || sessionSnap.data().state !== state) {
+
+  if (!sessionSnap.exists) {
+    console.error(`[callback] no verifications/${discordId} doc in Firestore -- session was never created, already cleared, or discordId mismatch`);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(400).send(errorPage(
+      'Link expired or invalid',
+      'This verification link is no longer valid. Run /verify start again in Discord.',
+    ));
+  }
+
+  if (sessionSnap.data().state !== state) {
+    // The doc exists but its `state` field doesn't match the state in
+    // this URL -- almost always because /verify start was run again
+    // (retry, double-click, panel button spam) after this link was
+    // generated, which overwrites the Firestore doc with a fresh state.
+    // The old DM link then permanently fails this check even though
+    // its own expiresAt hasn't passed yet.
+    console.error(`[callback] state mismatch for discordId=${discordId} -- Firestore doc has a different/newer state than this URL. Likely caused by /verify start being re-run after this link was issued.`);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.status(400).send(errorPage(
       'Link expired or invalid',
@@ -86,7 +119,7 @@ module.exports = async (req, res) => {
     if (!tokenRes.ok) throw new Error(`token exchange failed: ${tokenRes.status}`);
     tokenJson = await tokenRes.json();
   } catch (err) {
-    console.error('Discord token exchange error:', err);
+    console.error('[callback] Discord token exchange error:', err);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.status(502).send(errorPage('Discord error', 'Could not exchange the authorization code. Try /verify start again.'));
   }
@@ -99,7 +132,7 @@ module.exports = async (req, res) => {
     if (!userRes.ok) throw new Error(`user fetch failed: ${userRes.status}`);
     discordUser = await userRes.json();
   } catch (err) {
-    console.error('Discord /users/@me error:', err);
+    console.error('[callback] Discord /users/@me error:', err);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.status(502).send(errorPage('Discord error', 'Could not confirm your account. Try /verify start again.'));
   }
@@ -109,6 +142,7 @@ module.exports = async (req, res) => {
   // session -- if the id from /users/@me doesn't match discordId from
   // the signed state, someone forwarded/reused a link that wasn't theirs.
   if (String(discordUser.id) !== String(discordId)) {
+    console.error(`[callback] account mismatch -- session was for discordId=${discordId} but OAuth token belongs to discordUser.id=${discordUser.id}`);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.status(403).send(errorPage(
       'Account mismatch',
@@ -118,6 +152,7 @@ module.exports = async (req, res) => {
   }
 
   await sessionRef.set({ status: 'oauth_done' }, { merge: true });
+  console.error(`[callback] success -- discordId=${discordId} marked oauth_done`);
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   return res.status(200).send(successPage());
