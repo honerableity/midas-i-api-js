@@ -9,23 +9,41 @@
  * flips the Firestore session to "oauth_done".
  *
  * Role assignment and the rules-agreement step both happen back in
- * Discord (commands/verify.py) -- this route never touches the bot
- * token/gateway, it only ever writes the session doc.
+ * Discord (commands/verify.py + utils/verify_listener.py) -- this
+ * route never touches the bot token/gateway, it only ever writes
+ * Firestore docs.
  *
- * DIAGNOSTIC LOGGING: temporary console.error() calls added at each
- * failure branch so Vercel logs show exactly which check failed. Safe
- * to strip once things are stable -- none of them log secrets, codes,
- * or full state/tokens.
+ * ALT-ACCOUNT FLAGGING (added):
+ * On every successful OAuth callback, this route records the caller's
+ * IP + a coarse User-Agent fingerprint into
+ * verificationFingerprints/{discordId}, checks the IP against
+ * proxycheck.io, and cross-references it against every OTHER
+ * discordId in that collection whose account is currently verified.
+ * A match doesn't block or kick anyone automatically -- it posts an
+ * embed to the mod-log channel for a human to review and act on via
+ * buttons (handled bot-side, see commands/altcheck.py).
+ *
+ * IMPORTANT CAVEAT (tell the user, don't just silently build this):
+ * IP address is a weak signal on its own -- campus wifi, mobile carrier
+ * CGNAT, and shared home networks routinely put unrelated people behind
+ * the same public IP. That's exactly why this only flags for manual
+ * review instead of auto-kicking.
+ *
+ * DIAGNOSTIC LOGGING: console.error() calls remain at each failure
+ * branch so Vercel logs show exactly which check failed. Safe to trim
+ * later -- none of them log secrets, codes, or full state/tokens.
  */
-const { getDb } = require('../lib/firebase');
+const { getDb, admin } = require('../lib/firebase');
 const { verifyState } = require('./_state');
 
 const DISCORD_TOKEN_URL = 'https://discord.com/api/oauth2/token';
 const DISCORD_USER_URL = 'https://discord.com/api/users/@me';
+const PROXYCHECK_URL = 'https://proxycheck.io/v2';
 
 const DISCORD_CLIENT_ID = process.env.DISCORD_OAUTH_CLIENT_ID;
 const DISCORD_CLIENT_SECRET = process.env.DISCORD_OAUTH_CLIENT_SECRET;
 const DISCORD_REDIRECT_URI = process.env.DISCORD_OAUTH_REDIRECT_URI;
+const PROXYCHECK_API_KEY = process.env.PROXYCHECK_API_KEY;
 
 function errorPage(title, message) {
   return `<!doctype html><html><body style="font-family:sans-serif;text-align:center;padding:4rem">
@@ -33,25 +51,162 @@ function errorPage(title, message) {
 }
 
 function successPage() {
-  return `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta http-equiv="refresh" content="4;url=discord://" />
-  <title>Verified</title>
-</head>
-<body style="font-family:sans-serif;text-align:center;padding:4rem">
-  <h2>You're authorized!</h2>
-  <p>Redirecting you back to Discord in a few seconds&hellip;</p>
-  <p>Click <b>Continue</b> there to accept the rules and get your role.</p>
-  <p><a href="discord://">Click here if you're not redirected automatically</a></p>
-  <script>
-    setTimeout(function () {
-      window.location.href = 'discord://';
-    }, 3500);
-  </script>
-</body>
-</html>`;
+  return `<!doctype html><html><body style="font-family:sans-serif;text-align:center;padding:4rem">
+<h2>You're authorized!</h2>
+<p>Go back to Discord -- I'll DM you the server rules in just a moment.</p></body></html>`;
+}
+
+/**
+ * Best-effort extraction of the caller's real IP. Vercel sits behind a
+ * proxy, so req.socket's address is Vercel's edge, not the visitor --
+ * x-forwarded-for is what actually carries it. When multiple proxies
+ * are involved the header can contain a comma-separated chain; the
+ * FIRST entry is the original client.
+ */
+function getClientIp(req) {
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) {
+    return String(xff).split(',')[0].trim();
+  }
+  return req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : null;
+}
+
+/**
+ * Coarse, dependency-free fingerprint from headers alone (no client-side
+ * JS run on this page, so this is intentionally weak -- it's a
+ * secondary signal to corroborate an IP match, not a standalone
+ * identifier). Hashing keeps the stored value short and avoids storing
+ * a raw User-Agent string per user.
+ */
+function computeFingerprint(req) {
+  const crypto = require('crypto');
+  const ua = req.headers['user-agent'] || '';
+  const lang = req.headers['accept-language'] || '';
+  const raw = `${ua}|${lang}`;
+  return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16);
+}
+
+/**
+ * Queries proxycheck.io for the given IP. Returns { isProxy, proxyType }
+ * or null if the check couldn't be completed (missing API key, network
+ * error, rate limit, etc) -- callers must treat null as "unknown", not
+ * "not a proxy".
+ */
+async function checkProxy(ip) {
+  if (!PROXYCHECK_API_KEY || !ip) return null;
+
+  try {
+    const url = `${PROXYCHECK_URL}/${encodeURIComponent(ip)}?key=${PROXYCHECK_API_KEY}&vpn=1&asn=1`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.error(`[callback] proxycheck.io returned ${res.status}`);
+      return null;
+    }
+    const data = await res.json();
+    const entry = data[ip];
+    if (!entry) return null;
+
+    return {
+      isProxy: entry.proxy === 'yes',
+      proxyType: entry.type || null,
+    };
+  } catch (err) {
+    console.error('[callback] proxycheck.io request failed:', err.message);
+    return null;
+  }
+}
+
+/**
+ * Records this verification attempt's IP/fingerprint, then looks for any
+ * OTHER discordId with a matching IP or fingerprint that is currently in
+ * verifiedUsers. Never throws -- alt-detection is a best-effort side
+ * channel and must never break the actual verification flow if Firestore
+ * hiccups here.
+ */
+async function recordAndCheckAltAccount(db, discordId, guildId, ip, fingerprint, proxyInfo) {
+  try {
+    const fpRef = db.collection('verificationFingerprints').doc(discordId);
+    await fpRef.set({
+      ip,
+      fingerprint,
+      guildId,
+      isProxy: proxyInfo ? proxyInfo.isProxy : null,
+      proxyType: proxyInfo ? proxyInfo.proxyType : null,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    if (!ip && !fingerprint) return null;
+
+    const matches = new Map(); // discordId -> { matchedOn: Set }
+
+    if (ip) {
+      const ipSnap = await db.collection('verificationFingerprints').where('ip', '==', ip).get();
+      ipSnap.forEach((doc) => {
+        if (doc.id === discordId) return;
+        if (!matches.has(doc.id)) matches.set(doc.id, new Set());
+        matches.get(doc.id).add('ip');
+      });
+    }
+
+    if (fingerprint) {
+      const fpSnap = await db.collection('verificationFingerprints').where('fingerprint', '==', fingerprint).get();
+      fpSnap.forEach((doc) => {
+        if (doc.id === discordId) return;
+        if (!matches.has(doc.id)) matches.set(doc.id, new Set());
+        matches.get(doc.id).add('fingerprint');
+      });
+    }
+
+    if (matches.size === 0) return null;
+
+    // Only care about matches against accounts that are CURRENTLY verified
+    // -- someone who already got kicked/unverified for this isn't a
+    // useful "main account" to flag against again.
+    const candidateIds = Array.from(matches.keys());
+    const verifiedChecks = await Promise.all(
+      candidateIds.map((id) => db.collection('verifiedUsers').doc(id).get()),
+    );
+
+    const confirmedMatches = [];
+    verifiedChecks.forEach((snap, i) => {
+      if (snap.exists) {
+        confirmedMatches.push({
+          discordId: candidateIds[i],
+          matchedOn: Array.from(matches.get(candidateIds[i])),
+        });
+      }
+    });
+
+    if (confirmedMatches.length === 0) return null;
+
+    return { newDiscordId: discordId, guildId, ip, isProxy: proxyInfo ? proxyInfo.isProxy : null, matches: confirmedMatches };
+  } catch (err) {
+    console.error('[callback] recordAndCheckAltAccount failed (non-fatal):', err.message);
+    return null;
+  }
+}
+
+/**
+ * Writes a pending review doc that the bot picks up and posts as an
+ * embed with action buttons in the mod-log channel. Done this way
+ * (Firestore write here, bot renders the message) for the same reason
+ * the oauth_done flow works this way -- this Vercel function has no
+ * access to the bot's gateway connection or token.
+ */
+async function flagPossibleAlt(db, altInfo) {
+  try {
+    await db.collection('altFlags').add({
+      newDiscordId: altInfo.newDiscordId,
+      guildId: altInfo.guildId,
+      ipPartial: altInfo.ip ? altInfo.ip.replace(/\.\d+$/, '.xxx') : null, // last IPv4 octet masked at rest
+      isProxy: altInfo.isProxy,
+      matchedAccounts: altInfo.matches,
+      status: 'pending',
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  } catch (err) {
+    console.error('[callback] flagPossibleAlt failed (non-fatal):', err.message);
+  }
 }
 
 module.exports = async (req, res) => {
@@ -91,7 +246,7 @@ module.exports = async (req, res) => {
     ));
   }
 
-  const { discordId } = payload;
+  const { discordId, guildId } = payload;
   console.error(`[callback] verifyState() OK for discordId=${discordId}, expiresAt=${payload.expiresAt}, now=${Date.now()}`);
 
   const sessionRef = db.collection('verifications').doc(discordId);
@@ -165,6 +320,26 @@ module.exports = async (req, res) => {
 
   await sessionRef.set({ status: 'oauth_done' }, { merge: true });
   console.error(`[callback] success -- discordId=${discordId} marked oauth_done`);
+
+  // --- Alt-account flagging (non-blocking best-effort) ---------------
+  // Everything below runs AFTER the session is already marked oauth_done,
+  // and none of it can fail the verification itself: recordAndCheckAltAccount
+  // and flagPossibleAlt both swallow their own errors and log instead of
+  // throwing, and the success page is returned regardless of the outcome.
+  const ip = getClientIp(req);
+  const fingerprint = computeFingerprint(req);
+  const proxyInfo = await checkProxy(ip);
+
+  if (proxyInfo && proxyInfo.isProxy) {
+    console.error(`[callback] proxycheck flagged ${discordId}'s IP as proxy/VPN (type=${proxyInfo.proxyType})`);
+  }
+
+  const altInfo = await recordAndCheckAltAccount(db, discordId, guildId, ip, fingerprint, proxyInfo);
+  if (altInfo) {
+    console.error(`[callback] possible alt account detected for ${discordId}: matches=${JSON.stringify(altInfo.matches)}`);
+    await flagPossibleAlt(db, altInfo);
+  }
+  // ---------------------------------------------------------------------
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   return res.status(200).send(successPage());
