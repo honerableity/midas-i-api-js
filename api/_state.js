@@ -4,13 +4,11 @@
  * same secret env var, same base64url encoding, same field names.
  */
 const crypto = require('crypto');
-
 const STATE_SECRET = process.env.VERIFY_STATE_SECRET;
 
 function b64urlEncode(buf) {
   return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
-
 function b64urlDecode(str) {
   const padded = str + '='.repeat((4 - (str.length % 4)) % 4);
   return Buffer.from(padded.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
@@ -19,8 +17,10 @@ function b64urlDecode(str) {
 function verifyState(state) {
   try {
     const dotIndex = state.indexOf('.');
-    if (dotIndex === -1) return null;
-
+    if (dotIndex === -1) {
+      console.error('[verifyState] no "." separator found in state string');
+      return null;
+    }
     const b64 = state.slice(0, dotIndex);
     const sigB64 = state.slice(dotIndex + 1);
 
@@ -29,17 +29,21 @@ function verifyState(state) {
 
     const sigBuf = Buffer.from(sigB64);
     const expectedBuf = Buffer.from(expectedSigB64);
+
     if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+      console.error(`[verifyState] signature mismatch -- got sig len=${sigB64.length}, expected len=${expectedSigB64.length}. secret_len=${STATE_SECRET ? STATE_SECRET.length : 'undefined'}`);
       return null;
     }
 
     const payload = JSON.parse(b64urlDecode(b64).toString('utf8'));
-    if (Date.now() > payload.expiresAt) return null;
-
+    if (Date.now() > payload.expiresAt) {
+      console.error(`[verifyState] signature OK but payload expired -- expiresAt=${payload.expiresAt}, now=${Date.now()}`);
+      return null;
+    }
     return payload;
   } catch (err) {
+    console.error('[verifyState] exception during verify:', err.message);
     return null;
   }
 }
-
 module.exports = { verifyState };
