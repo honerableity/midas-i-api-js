@@ -1,8 +1,7 @@
 /**
- * _state.js -- shared HMAC state check, mirrored from the bot-side
- * utils/verification.py (_sign_state / verify_state). Must stay
- * byte-for-byte compatible with that file: same secret env var, same
- * base64url encoding, same field names. If you change one, change both.
+ * api/_state.js -- shared HMAC state check, mirrored from the bot-side
+ * utils/verification.py (_sign_state / verify_state). Keep both in sync:
+ * same secret env var, same base64url encoding, same field names.
  */
 const crypto = require('crypto');
 
@@ -17,10 +16,6 @@ function b64urlDecode(str) {
   return Buffer.from(padded.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
 }
 
-/**
- * Returns the decoded payload ({discordId, guildId, expiresAt}) if the
- * state's signature is valid and it hasn't expired, otherwise null.
- */
 function verifyState(state) {
   try {
     const dotIndex = state.indexOf('.');
